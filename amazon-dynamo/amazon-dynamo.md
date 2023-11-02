@@ -260,21 +260,160 @@ The key takeaway is that Dynamo's replication strategy is designed for high avai
 
 ### 4.4 Data Versioning
 
+As previously stated, Dynamo provides eventual consistentcy. Updates are propagated to replicas, asynchronously.
+
+> I.E. `A put()` call may return to the caller before the update has reached all replicas. Which can lead to subsequent `get()` ops. returning an object without the latest updates.
+
+Usually, under normal conditions, the period of time for update propagation is bounded. However, under failure conditions, updates may not arrive for an extended period of time.
+
+**Amazon Shopping Cart Example** : This application tolerates such inconsistencies. The app requires that the `Add to Cart` operation is never ignored or rejected. If a user makes changes to the cart, the change is meaningful and should be preserved, even if the state of the cart is unavailable and the changes were made in an older version of the cart. However, it shouln't supersede the "unavailable" changes.
+
+Divergent versions are reconciled later. But how?
+
+Multiple versions of an object can coexist in the system simultaneously. Typically, new versions replace the previous ones, and the system itself can identify the authoritative version, a process known as syntactic reconciliation.
+
+> **Syntactic reconciliation**, in the context of data management and version control, is a mechanism that determines the authoritative or preferred version of data based on syntactic or structural criteria. It involves comparing different versions of the same data and selecting one as the "winner" based on predefined rules or criteria.
+
+However, there are times were version branching might occur due to the presence of failures combined with concurrent updates. The system cannot reconcile these versions automatically, and the client must perform the reconciliation in order to collapse multiple versions into a single one (semantic reconciliation).
+
+> Example of a collapse operation: “merging” different versions of a customer’s shopping cart. Using this reconciliation mechanism, an “add to cart” operation is never lost. However, deleted items can resurface.
+
+Dynamo uses **vector clocks** to capture causality between different versions of the same object.
+A vector clock is essentially a list of (node, counter) pairs. One vector clock per object version.
+
+Determine whether two versions are on parallel branches or have a causal ordering --> compare the two vector clocks.
+
+- If the first object's vector clock is "less than equal" to all nodes on the second object's vector clock, then the first is an ancestor of the second and can be discarded.
+- Othewise the changes are considered to be in conflict and require conciliation.
+
+To update an object in Dynamo, the client must first specify which version is being updated. Clients do this by passing the context obtained in a previous read op. The context contains the vector clock info.
+
 ### 4.5 Execution of get() and put() Operations
+
+Any storage node is eligible to receive client `get` and `put` operations for a key. The operations are invoked using Amazon's infrastructure-specific request processing framework over HTTP.
+
+Two strategies that a client can use to select a node:
+
+- route its request through a generic load balancer that'll choose a node based on load information.
+- use a partition-aware client library that routes requests directly to the appopriate *coordinator node.*
+
+The first approach frees the client of having to link any code specific to Dynamo in its app, while hte second approach can achieve lower latency because it is potentially skipping a forwarding step.
+
+A node that handles a read or write request is called a *coordinator node*. Usually, this is the first among the top N nodes in the preference list. If requests are received through a load balancer, requests to acess a key may be routed to any random node in the ring. In this case, the receiving node will NOT coordinate the request if it's not in the top N nodes of the requested key's preference list. Instead, it'll forward the request to the first among the top N nodes in the preference list.
+
+If all nodes are healthy, the top N nodes in a key's preference list will be accessed. Otherwise, nodes ranked lower in the preference list will instead be accessed.
+
+In order to main consistency across all replicas:
+
+- Dynamo uses a protocol similar to quorum systems. The protocol has two configurable parameters: R and W.
+  - R is the minimum number of nodes that must participate in a successful read operation.
+  - W is the minimum number of nodes that must participate in a successful write operation.
+- R + W > N configuration yields a quorum-like system. Latency is dictated by the slowest of the R (or W) replicas. For this reason, R and W are typically configured to be less than N, to provide better latency.
+
+When a coordinator nodes receives a `put()` request for a key, it generates the vector clock for the new version and writes it locally. Then, it sends the new version (alongside the new vector clock) to the N highest-rated reachable nodes. If at least `W-1` nodes respond, then a write is considered successful.
+
+Similarly, for a `get()` request, the coordinator requests all existing versions of data for that key from the N highest-rated reachable in the key's preference list. It then waits for `R` responses before returing the result to the caller. If multiple versions of data are gathered, it'll return all versions it deems to be casually unrelated. The divergent versions are then reconciled and then the reconciled version superseeding current versions is written back.
 
 ### 4.6 Handling Failures: Hinted Handoff
 
+Had Dynamo's developers chosen to use a quorom-like system, the system would have been unavailable in the event of server failures and network partitions and would have reduced durability even under simple failure scenarios.
+
+To remedy this, Dynamo uses a "sloppy quorom": all reads (and writes) are performed on the first N healthy nodes in the preference list, which may NOT always be the first N nodes encoutered while traversing the consistent hashing ring.
+
+> Observe the figure below. Imagine N=3. If A dies during a write operation, then a replica that would have lived on A will be sent to node D. This replica will have a **hint** in its metadata that suggest which node was the intended recepient. D will keep this replica in a separate local store that'll scanned periodically. When D detects A has recoverd, it'll attempt to deliver the replica to A. If succesfull, D may delete the replica from its local store.
+
+<p align="center">
+  <img src="images/replication.png" alt="Replication" width="500"/>
+</p>
+
+Using hinted handoff, the process above described, Dynamo ensures that the read and write
+operations are not failed due to temporary node or network
+failures.
+
+If an app needs a really high level of availability, it can W to be 1, which ensures that the write will be accepted as long as at least one node has durably written the key to its local storage. In pratice, most Amazon services in production have W set higher to achieve a higher durability guarantee.
+
+Even in an event of datacenter failure (natural disaster, network failure, cooling issues, wtv), Dynamo allows Amazon to handle entire data center failures withough data outage. This is achieved by placing replicas in multiple data centers. In essance, the preference list of a key is constructed such that the storage nodes are spread across multiple data centers.
+
 ### 4.7 Handling Permanent Failures: Replica Synchronization
+
+Hinted takeoff will work in situations where system membership churn is low and node failures are transient.
+
+- Low membership churn: the membership of the system changes slowly over time, i.e, nodes are not frequently leaving or entering the system.
+- Transient node failures: nodes that fail will eventually recover.
+
+There are scenarios where hinted replicas become unavailable before they can be delivered to the intended recipient. To handle this, Dynamo implements an **anti-entropy** (**replica synchronization**) protocol based to keep replicas synchronized.
+
+The protocol is based on Merkle trees, which are hash trees where leaves are hashes of the values of the individual keys. Parent nodes higher in the tree are hashes of their respecive children.
+
+Main advantage: each branch of the tree can be checked independently without requiring nodes to download the entire tree or the entire data set. It reduces the amount of data that needs to be transferred while checking for inconsistencies among replicas.
+
+> Imagine two trees. If the hash values of the root nodes are the same, then the values of the leaf nodes are equal, and no synchronization is required. If not, it implies different replica values. In such cases, nodes may enchange hash values of the children and the process repeats until the end of the tree is reached.
+
+Dynamo uses Merkle trees as follows:
+
+- Each node maintains a tree for each key range (set of keys covered by a virtual node) it hosts.
+- Two nodes exchange the root of the tree corresponding to the key ranges they host in common.
+  - Subsequently the nodes determine if they have any differences and perform the appropriate synchronization action.
+
+The main disadvantage of this approach is that many key ranges will change when a node joins or leaves the system which requires tree recalculation. This issues is address in [Section 6.2](#62-ensuring-uniform-load-distribution).
 
 ### 4.8 Membership and Failure Detection
 
+The following sections discuss the membership and failure detection protocols used by Dynamo.
+
 #### 4.8.1 Ring Membership
+
+In Amazon environment, most node failures are transient. It was deemed appropriate to use an explicit mechanism to initiate the addition or removal of a node from the ring. This is done manually using command-line tools or browser by an administrator.
+
+The nodes that serves this request will write the membership to persistent store. Membership changes form a history. To propagate membership changes, a gossip-based protocol is used and it'll maintain an eventually consistent view of membership. Each node contacts a peer chosen at random every second and these two nodes will reconcile their persisted membership change histories.
+
+When a node starts for the first time, it'll choose its set of tokens (virtual nodes in consistent hashing space) and maps nodes to theire respective token sets. The mapping is persisted on disk and, at first, contains only the local node and token set. Mappings stores at different Dyanamo nodes are reconciled using the same comuniaction exchange that reconciled membership changes.
+
+Therefore, partitoning and placement info also propagates through the gossip protocol.
 
 #### 4.8.2 External Discovery
 
+The mechanism above described could result in a temporary logically partioned Dynamo ring.
+
+> Admin contacts node A to join A to the ring, then contacts node B to join B to the ring. However, A and B are not aware of each other. This results in a temporary logically partitioned Dynamo ring.
+
+To prevent this, some nodes play the role of seeds. Seeds are nodes that are discovered using an external mechanism and are known to all nodes. All nodes will eventually reconcile their membership with a seed, and thus logical partitions are highly unlikely.
+
+Seeds are either obtained from static configuration or from a configuration service and act as fully functional nodes in the Dynamo ring.
+
 #### 4.8.3 Failure Detection
 
+Failure detection is used to avoid attemps at communicating with unreachable nodes during `put` or `get` operations and when transferring partitions and hinted replicas.
+
+A local notion of failure is sufficient:
+
+> Node A may consider node B to be failed if it does not respond to A's messages, even if B is still responding to C's requests.
+
+- A steady rate of client request that generate intercommunication between nodes in the ring will allow A to quickly detect B's failure. Node A will then use alternate nodes in the preference list to perform the operation.
+- In the absence of client request that drive traffic between nodes, neither node really needs to know about the other's failure.
+
+Decentralized failure detection protocols also use a gossip-style protocol that allows each node in the system to be informed about a node's departure (or arrival) to the system.
+
+Early Dynamo designs used a protocol like that. Later, it was determined that the explicit node join and leave methods obviates the need for a global view of failure state.
+
+> Nodes are notified of permanent node addictions and removals by the explicit node join and leave methods and, temporary failures are detected by individual nodes, when they fail to communicate with other nodes (when forwarding requests or transferring data).
+
 ### 4.9 Adding and Removing Storage Nodes
+
+Let's consider the same figure and that a node, let's say X. is added to the system.
+
+<p align="center">
+  <img src="images/replication.png" alt="Replication" width="500"/>
+</p>
+
+X was assigned a random number of tokens scattered across the ring. For every key range that is assigned to node X, there might be a number of nodes that are currently in charge of that key range.
+
+Let's say X has been added to the ring, in-between node A and B.
+When joining the ring, it'll be in charge of storing keys in the following ranges: (F-G], (G-A] and (A-X].
+
+Thus, nodes B, C and D will no longer have to store the keys in the respective ranges. These nodes will offer to, and, upon confirmation, tranfer the appropriate keys to node X. When a node is removed, the process is reversed.
+
+Experience has shown that this approach distributes the load of key distribution uniformly across storage nodes. Furthermore, by adding the confirmation round between src and dest, it is made sure that the dest node does not receive any duplicate transfers for a key range.
 
 ## 5. Implementation
 
