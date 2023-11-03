@@ -417,7 +417,70 @@ Experience has shown that this approach distributes the load of key distribution
 
 ## 5. Implementation
 
+Now let's actually talk about the implementation of Dynamo. Theory will only take us so far.
+
+In Dynamo, each storage node has three main software components:
+
+- request coordination
+- membership and failure detection
+- local persistence engine
+
+**Local persistence component**: allows for different storage engines to be plugged in. The ones used by Dynamo are:
+
+- Berkeley Database (BDB) transactional data store
+- BDB Java Edition
+- MySQL
+- In-memory buffer with persistent backing store
+
+But why did they chose to design a pluggable persistence component? - Choose the best suited storage engine for the application's access patterns.
+
+- BDB handles objects in the tens of kilobytes order, whereas MySQL handles objects with larger sizes.
+
+Majority of Dynamo's production instances use BDB Transactional Data Store.
+
+**Request coordination component**: All communication are implemented using JAVA NIO channels.
+
+- Coordinator nodes execute read and write operation on behalf of the clients.
+- Each client request creates a state machine on the node that receives the request.
+  - This state machine contains all logic for identifying the nodes responsible for a key, sending requests, waiting for responses, potentially doing retries, processing replies and packaging the final response to the client.
+
+Each state machine handles **exactly one** client request.
+
+Typlical state machine steps for a `get()` operation:
+
+- send read requests to nodes
+- wait for minumum number of responses (R) to return
+- if too few responses were received, fail the request
+- otherwise gather all data versions and decide those to be returned to the client
+- if versioning is enabled, perform syntactic reconciliation and generate opaque write context that contains the vector clock that subsumes all remaining versions
+- after response has been return to the caller, the state machine will wait for a configurable amount of time for the remaining responses to arrive
+  - If stale responses arrive, the coordinator will update those nodes with the latest version of the data.
+
+As noted earlier, write requests are coordinated by one of the top N nodes in the preference list. Although it is desirable always to have the first node among the top N to coordinate the writes
+thereby serializing all writes at a single location, this approach has led to uneven load distribution resulting in SLA violations.
+
+To counter this, **any** of the top N nodes in the preference list can coordinate a write request. This approach has led to a more uniform load distribution across the nodes in the system.
+
+Since a write usually follows a read operation, the coordinator node that handled the read operation will also coordinate the write operation. This info. is store in the context information of the request.
+
 ## 6. Experiences and Lessons Learned
+
+Dynamo is used by many services with different configurations.
+These services differ by their version reconciliation logic and read/write operation quorum configuration.
+
+Main patterns:
+
+- **Business logic specific reconciliation** : Each data object is replicated across multiple nodes and in the case of divergent versions, the client application performs the reconciliation. This approach is used by the shopping cart service.
+- **Time-based reconciliation** : The reconciliation logic is based on time stamps. The most recent version is picked as the winner. This approach is used by the session management service.
+- **High-performance read engine**: Even though Dynamo was build with an "always writable" approach in mind, a few services are turning its quorum characteristics around to achieve high read performance. R is typically then set to 1 and W to be N. Services that maintain product catalog and promotional items fit this pattern.
+
+Dynamo allows its client applications to fine-tune the values of R, N and W to achieve their desired levels of performance, availability and durability.
+
+- The value of N determines the durability of each object. Typical value: 3
+- R and W impact object availability, durability and consistency. If W is set to 1, the system will never reject a write request as long as there's at least a node that can serve the request.
+  - However, low values of W and R might lead to inconsistency as write requests might be deemed successful even if they are not processed by majority of the replicas.
+
+The common configuration for (N, R, W) used by many services is (3, 2, 2). These values are chosen to meet the necessary durability, availability, performance and consistency SLAs.
 
 ### 6.1 Balancing Performance and Durability
 
